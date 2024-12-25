@@ -1,439 +1,390 @@
 import os
-import numpy as np
 import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+from statsmodels.tsa.stattools import coint
+from datetime import datetime
+from binance.client import Client
+from binance.enums import HistoricalKlinesType
 
-import tensorflow as tf
-from tensorflow.keras import layers, models, regularizers
-from tensorflow.keras.optimizers import Adam
-
-from sklearn.preprocessing import StandardScaler
-
-###############################################################################
-# PART A. INDICATOR CALCULATIONS
-###############################################################################
-
-def compute_sma(series, window=50):
-    """Simple Moving Average."""
-    return series.rolling(window=window, min_periods=window).mean()
-
-def compute_ema(series, window=20):
-    """Exponential Moving Average."""
-    return series.ewm(span=window, adjust=False).mean()
-
-def compute_rsi(series, window=14):
-    """
-    Relative Strength Index (RSI) using the classic Wilder's formula.
-    Returns RSI in [0, 100].
-    """
-    delta = series.diff()
-    gains = delta.where(delta > 0, 0.0)
-    losses = -delta.where(delta < 0, 0.0)
-    avg_gain = gains.ewm(alpha=1/window, adjust=False).mean()
-    avg_loss = losses.ewm(alpha=1/window, adjust=False).mean()
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1.0 + rs))
-    return rsi
-
-def compute_macd(series, fast=12, slow=26, signal=9):
-    """
-    MACD: difference between fast EMA and slow EMA.
-    Returns (macd_line, macd_signal).
-    """
-    ema_fast = compute_ema(series, window=fast)
-    ema_slow = compute_ema(series, window=slow)
-    macd_line = ema_fast - ema_slow
-    macd_signal = macd_line.ewm(span=signal, adjust=False).mean()
-    return macd_line, macd_signal
-
-def compute_bollinger_bands(series, window=20, num_std=2):
-    """
-    Bollinger Bands (Upper and Lower).
-    """
-    rolling_mean = series.rolling(window=window, min_periods=window).mean()
-    rolling_std = series.rolling(window=window, min_periods=window).std()
-    bb_high = rolling_mean + (rolling_std * num_std)
-    bb_low = rolling_mean - (rolling_std * num_std)
-    return bb_high, bb_low
 
 ###############################################################################
-# PART B. DATA PREPARATION
+# 1. DATA ACQUISITION
 ###############################################################################
+API_KEY = "<YOUR_BINANCE_API_KEY>"
+API_SECRET = "<YOUR_BINANCE_API_SECRET>"
+client = Client(API_KEY, API_SECRET)
 
-def add_technical_indicators(df):
-    """Local calculation of common indicators."""
-    df['RSI'] = compute_rsi(df['close'], window=14)
-    df['MACD'], df['MACD_Signal'] = compute_macd(df['close'], fast=12, slow=26, signal=9)
-    df['BB_High'], df['BB_Low'] = compute_bollinger_bands(df['close'], window=20, num_std=2)
-    df['EMA_20'] = compute_ema(df['close'], window=20)
-    df['SMA_50'] = compute_sma(df['close'], window=50)
-    df.dropna(inplace=True)
+
+def fetch_klines_if_needed(symbol: str,
+                           interval: str = Client.KLINE_INTERVAL_1HOUR,
+                           start_date: str = "1 Jan, 2021",
+                           end_date: str = None,
+                           filename: str = None) -> pd.DataFrame:
+    """
+    Fetches historical klines (candles) from Binance if 'filename' doesn't exist locally.
+    Saves to CSV and returns as a pandas DataFrame. Otherwise, loads local CSV with parse_dates.
+    """
+    if filename is None:
+        filename = f"{symbol}_{interval}_data.csv"
+
+    if os.path.exists(filename):
+        print(f"[INFO] Loading data locally from {filename}...")
+        # Since the CSV should have normal date strings, parse them as standard datetimes:
+        df = pd.read_csv(filename, parse_dates=['open_time'])
+        return df
+    else:
+        print(f"[INFO] Fetching data from Binance for {symbol}...")
+        klines = client.get_historical_klines(
+            symbol=symbol,
+            interval=interval,
+            start_str=start_date,
+            end_str=end_date,
+            klines_type=HistoricalKlinesType.SPOT
+        )
+        # Convert to DataFrame
+        df = pd.DataFrame(klines, 
+                          columns=['open_time', 'open', 'high', 'low', 'close',
+                                   'volume', 'close_time', 'quote_asset_volume',
+                                   'number_of_trades', 'taker_buy_base_asset_volume',
+                                   'taker_buy_quote_asset_volume', 'ignore'])
+        
+        # Convert numeric columns
+        numeric_cols = ['open','high','low','close','volume','quote_asset_volume',
+                        'taker_buy_base_asset_volume','taker_buy_quote_asset_volume']
+        for col in numeric_cols:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        # Convert 'open_time' from ms to a normal datetime
+        df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
+        
+        # Sort by time
+        df.sort_values('open_time', inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        
+        # Save to CSV. 'open_time' now has ISO8601 date strings:
+        df.to_csv(filename, index=False)
+        return df
+
+
+# Fetch BTC/USDT data
+btc_df = fetch_klines_if_needed(symbol="BTCUSDT",
+                                interval=Client.KLINE_INTERVAL_1HOUR,
+                                start_date="1 Jan, 2021",
+                                filename="BTCUSDT_1H.csv")
+
+# Fetch ETH/USDT data
+eth_df = fetch_klines_if_needed(symbol="ETHUSDT",
+                                interval=Client.KLINE_INTERVAL_1HOUR,
+                                start_date="1 Jan, 2021",
+                                filename="ETHUSDT_1H.csv")
+
+
+###############################################################################
+# 2. DATA PREPROCESSING
+###############################################################################
+def preprocess_data(df: pd.DataFrame, price_col: str = 'close') -> pd.DataFrame:
+    """
+    Prepares kline data into a simpler format with columns [datetime, price].
+    Ensures no missing timestamps (if so, consider forward fill or drop).
+    """
+    df = df[['open_time', price_col]].copy()
+    df.rename(columns={'open_time': 'datetime',
+                       price_col: 'price'}, inplace=True)
+    df.set_index('datetime', inplace=True)
     return df
 
-def add_dummy_fundamental_features(df):
+btc_df_prep = preprocess_data(btc_df)
+eth_df_prep = preprocess_data(eth_df)
+
+# Merge on the index (datetime)
+merged_df = pd.merge(btc_df_prep, eth_df_prep, left_index=True, right_index=True,
+                     how='inner', suffixes=('_BTC', '_ETH'))
+
+merged_df.dropna(inplace=True)  # Drop any rows with NaN
+merged_df.sort_index(inplace=True)
+
+
+###############################################################################
+# 3. COINTEGRATION UTILITIES
+###############################################################################
+def engle_granger_cointegration(x: pd.Series, y: pd.Series):
     """
-    Dummy function simulating fundamental or sentiment data. 
-    Replace with real fundamentals, cross-sectional signals, or textual sentiment.
+    Performs Engle-Granger cointegration test on x and y, returning:
+        - coint_t (test statistic)
+        - p_value
+        - critical_values
+        - hedge_ratio (from linear regression y ~ x)
     """
-    np.random.seed(42)
-    df['PE_Ratio'] = np.random.normal(15, 3, size=len(df))   # Fake P/E
-    df['Sentiment'] = np.random.uniform(-1, 1, size=len(df)) # Fake sentiment
+    # 1) Regress y on x to find hedge ratio
+    x_const = sm.add_constant(x)
+    model = sm.OLS(y, x_const).fit()
+    hedge_ratio = model.params.iloc[-1]  # last parameter is slope
+
+    # 2) Engle-Granger cointegration test
+    coint_t, p_value, crit_values = coint(y, x)
+    return coint_t, p_value, crit_values, hedge_ratio
+
+
+def rolling_cointegration_check(df: pd.DataFrame,
+                                window: int = 200,
+                                alpha: float = 0.05) -> pd.DataFrame:
+    """
+    Checks cointegration on a rolling basis for the last 'window' bars.
+    Creates columns:
+      - coint_pval: The Engle-Granger p-value in that window
+      - hedge_ratio: The slope in that window
+    We only do this once we have at least 'window' data points.
+    """
+    df = df.copy()
+    df['coint_pval'] = np.nan
+    df['hedge_ratio'] = np.nan
+    
+    for i in range(window, len(df)):
+        sub_btc = df['price_BTC'].iloc[i - window:i]
+        sub_eth = df['price_ETH'].iloc[i - window:i]
+        _, p_val, _, hr = engle_granger_cointegration(sub_btc, sub_eth)
+        df.loc[df.index[i], 'coint_pval'] = p_val
+        df.loc[df.index[i], 'hedge_ratio'] = hr
+    
     return df
 
-def scale_features(df, price_cols, indicator_cols, extra_cols=None):
-    """
-    Scales selected columns using StandardScaler.
-    """
-    if extra_cols is None:
-        extra_cols = []
-    all_cols = price_cols + indicator_cols + extra_cols
-    scaler = StandardScaler()
-    df[all_cols] = scaler.fit_transform(df[all_cols])
-    return df, scaler
-
-def create_multiday_label(df, horizon=5):
-    """
-    Label = 1 if close[t+horizon] > close[t], else 0.
-    This is a multi-day horizon label, often used in FEN research.
-    """
-    df['Target'] = (df['close'].shift(-horizon) > df['close']).astype(int)
-
-def prepare_fen_data(
-    df,
-    window_size=30,
-    horizon=5,
-    price_cols=('Open', 'High', 'Low', 'close', 'Volume'),
-    indicator_cols=None,
-    extra_cols=None
-):
-    """
-    Prepares data for the Fused Encoded Network with a multi-day horizon target.
-    """
-    if indicator_cols is None:
-        indicator_cols = ['RSI', 'MACD', 'MACD_Signal', 'BB_High', 'BB_Low', 'EMA_20', 'SMA_50']
-    if extra_cols is None:
-        extra_cols = ['PE_Ratio', 'Sentiment']
-
-    # Create the multi-day horizon label
-    create_multiday_label(df, horizon=horizon)
-    df.dropna(inplace=True)  # remove rows with NaN from shift or indicators
-
-    # Scale relevant columns
-    df, _ = scale_features(df, list(price_cols), list(indicator_cols), extra_cols)
-
-    # Build arrays
-    price_array = df[list(price_cols)].values
-    indicator_array = df[list(indicator_cols)].values
-    extra_array = df[list(extra_cols)].values  # e.g. fundamental / sentiment
-    
-    # Build sequence data from the scaled price array
-    seq_data = []
-    for i in range(len(df) - window_size):
-        seq_slice = price_array[i : i + window_size]
-        seq_data.append(seq_slice)
-    seq_data = np.array(seq_data)
-
-    # Align labels with sequences
-    y = df['Target'].values[window_size:]
-
-    # Also align the single-time inputs
-    price_array = price_array[window_size:]
-    indicator_array = indicator_array[window_size:]
-    extra_array = extra_array[window_size:]
-
-    # Track the close prices for backtesting later
-    # (We shift them as well to match the labels)
-    close_prices = df['close'].values[window_size:]
-
-    return price_array, indicator_array, seq_data, extra_array, y, close_prices
 
 ###############################################################################
-# PART C. FUSED ENCODED NETWORK MODEL
+# 4. SIGNAL GENERATION (Z-SCORE) WITH ROLLING COINTEGRATION FILTER
 ###############################################################################
-
-def build_fen_model(
-    input_dim_price=5,
-    input_dim_indicators=7,
-    input_dim_extra=2,
-    seq_length=30,
-    seq_features=5,
-    task_type='binary',
-    num_classes=1,
-    hidden_units=64,
-    l2_reg=0.001,
-    dropout_rate=0.2
-):
+def generate_signals(merged: pd.DataFrame,
+                     lookback: int = 24, 
+                     entry_z: float = 2.5,   # more conservative
+                     exit_z: float = 1.0,    # likewise, give room to revert
+                     coint_window: int = 200,
+                     coint_alpha: float = 0.05):
     """
-    Fused Encoded Network with:
-      - Price input
-      - Technical indicators input
-      - LSTM + Multi-Head Attention for sequential data
-      - Extra/fundamental/sentiment
-      - Output: binary, multi, or regression
+    Generates trading signals based on:
+      1) Rolling cointegration test (p-value < coint_alpha)
+      2) Z-score of the spread = ETH - hedge_ratio * BTC
+         with a rolling lookback window for mean & std.
+    We only enter trades if p-value < coint_alpha.
     """
-    # 1. Price Branch
-    price_input = layers.Input(shape=(input_dim_price,), name='Price_Input')
-    x_price = layers.Dense(hidden_units, activation='relu',
-                           kernel_regularizer=regularizers.l2(l2_reg))(price_input)
-    x_price = layers.BatchNormalization()(x_price)
-    x_price = layers.Dropout(dropout_rate)(x_price)
-    x_price = layers.Dense(hidden_units//2, activation='relu',
-                           kernel_regularizer=regularizers.l2(l2_reg))(x_price)
-    x_price = layers.BatchNormalization()(x_price)
+    df = rolling_cointegration_check(merged, window=coint_window, alpha=coint_alpha)
+    
+    # Initialize columns for signals
+    df['spread'] = np.nan
+    df['spread_mean'] = np.nan
+    df['spread_std'] = np.nan
+    df['zscore'] = np.nan
+    df['signal'] = 0
+    
+    # Compute spread using the rolling hedge ratio
+    valid_idx = df.index[df['hedge_ratio'].notna()]
+    
+    for i in range(coint_window, len(df)):
+        hr = df.loc[df.index[i], 'hedge_ratio']
+        # We'll look back 'lookback' bars to compute rolling mean/std
+        window_slice = df.iloc[i - lookback + 1 : i + 1]
+        
+        spread_series = window_slice['price_ETH'] - hr * window_slice['price_BTC']
+        spread_mean = spread_series.mean()
+        spread_std = spread_series.std()
+        
+        current_spread = spread_series.iloc[-1]
+        zscore_value = (current_spread - spread_mean) / spread_std if spread_std != 0 else 0
+        
+        df.loc[df.index[i], 'spread'] = current_spread
+        df.loc[df.index[i], 'spread_mean'] = spread_mean
+        df.loc[df.index[i], 'spread_std'] = spread_std
+        df.loc[df.index[i], 'zscore'] = zscore_value
+        
+        # Only generate signals if p-value < coint_alpha
+        if df.loc[df.index[i], 'coint_pval'] < coint_alpha:
+            # Enter Long if zscore < -entry_z
+            if zscore_value < -entry_z:
+                df.loc[df.index[i], 'signal'] = 1
+            # Enter Short if zscore > entry_z
+            elif zscore_value > entry_z:
+                df.loc[df.index[i], 'signal'] = -1
+            else:
+                df.loc[df.index[i], 'signal'] = 0
+        else:
+            # If not cointegrated, no new positions
+            df.loc[df.index[i], 'signal'] = 0
+    
+    return df
 
-    # 2. Indicator Branch
-    indicator_input = layers.Input(shape=(input_dim_indicators,), name='Indicator_Input')
-    x_ind = layers.Dense(hidden_units, activation='relu',
-                         kernel_regularizer=regularizers.l2(l2_reg))(indicator_input)
-    x_ind = layers.BatchNormalization()(x_ind)
-    x_ind = layers.Dropout(dropout_rate)(x_ind)
-    x_ind = layers.Dense(hidden_units//2, activation='relu',
-                         kernel_regularizer=regularizers.l2(l2_reg))(x_ind)
-    x_ind = layers.BatchNormalization()(x_ind)
+signal_df = generate_signals(merged_df, 
+                             lookback=24,    # or larger if you want a smoother signal
+                             entry_z=2.5,    # can tweak
+                             exit_z=1.0, 
+                             coint_window=200,
+                             coint_alpha=0.05)
 
-    # 3. Sequential Branch
-    seq_input = layers.Input(shape=(seq_length, seq_features), name='Sequential_Input')
-    x_seq = layers.LSTM(hidden_units, return_sequences=True,
-                        kernel_regularizer=regularizers.l2(l2_reg))(seq_input)
-    x_seq = layers.BatchNormalization()(x_seq)
-
-    # Multi-Head Self-Attention
-    attn = layers.MultiHeadAttention(num_heads=4, key_dim=hidden_units//4)(x_seq, x_seq)
-    x_seq = layers.Add()([x_seq, attn])  # Residual
-    x_seq = layers.LayerNormalization()(x_seq)
-    x_seq = layers.GlobalAveragePooling1D()(x_seq)
-    x_seq = layers.Dense(hidden_units//2, activation='relu',
-                         kernel_regularizer=regularizers.l2(l2_reg))(x_seq)
-    x_seq = layers.BatchNormalization()(x_seq)
-
-    # 4. Extra / Fundamental Branch
-    extra_input = layers.Input(shape=(input_dim_extra,), name='Extra_Input')
-    x_extra = layers.Dense(hidden_units//2, activation='relu',
-                           kernel_regularizer=regularizers.l2(l2_reg))(extra_input)
-    x_extra = layers.BatchNormalization()(x_extra)
-    x_extra = layers.Dropout(dropout_rate)(x_extra)
-    x_extra = layers.Dense(hidden_units//4, activation='relu',
-                           kernel_regularizer=regularizers.l2(l2_reg))(x_extra)
-    x_extra = layers.BatchNormalization()(x_extra)
-
-    # 5. Fusion
-    fused = layers.Concatenate(axis=-1)([x_price, x_ind, x_seq, x_extra])
-    fused = layers.Dense(hidden_units, activation='relu',
-                         kernel_regularizer=regularizers.l2(l2_reg))(fused)
-    fused = layers.BatchNormalization()(fused)
-    fused = layers.Dropout(dropout_rate)(fused)
-    fused = layers.Dense(hidden_units//2, activation='relu',
-                         kernel_regularizer=regularizers.l2(l2_reg))(fused)
-    fused = layers.BatchNormalization()(fused)
-
-    # 6. Output Layer
-    if task_type == 'binary':
-        output = layers.Dense(1, activation='sigmoid', name='Output')(fused)
-        loss = 'binary_crossentropy'
-        metrics = ['accuracy']
-    elif task_type == 'multi':
-        output = layers.Dense(num_classes, activation='softmax', name='Output')(fused)
-        loss = 'categorical_crossentropy'
-        metrics = ['accuracy']
-    else:  # regression
-        output = layers.Dense(1, activation='linear', name='Output')(fused)
-        loss = 'mse'
-        metrics = ['mae']
-
-    model = models.Model(
-        inputs=[price_input, indicator_input, seq_input, extra_input],
-        outputs=output
-    )
-    model.compile(optimizer=Adam(1e-4), loss=loss, metrics=metrics)
-    return model
 
 ###############################################################################
-# PART D. SIMPLE BACKTESTING AND SHARPE METRICS
+# 5. BACKTEST (AVOIDING LOOK-AHEAD BIAS) + STOP LOSS
 ###############################################################################
-
-def simple_backtest(predictions, close_prices, horizon=1, cost=0.0005):
+def backtest_pairs(signal_data: pd.DataFrame,
+                   initial_capital: float = 10000,
+                   trading_fee_rate: float = 0.0004,
+                   exit_z: float = 1.0,
+                   max_adverse_move: float = 50.0):
     """
-    A simple daily backtest:
-      - predictions > 0.5 => go long for the next day; predictions < 0.5 => go short
-      - horizon: how many days you hold the position (1 by default)
-      - cost: transaction cost (round-turn). E.g. 0.0005 => 0.05% each trade.
+    Simplified backtest for cointegration-based pairs trading:
+      - Next-bar execution to avoid look-ahead bias.
+      - Position can be long spread (1) or short spread (-1) or flat (0).
+      - We exit if |zscore| < exit_z OR if the trade hits a stop loss (max_adverse_move).
+        * 'max_adverse_move' is a fixed threshold in spread terms.
 
-    Returns:
-      - daily_returns (pd.Series): daily returns from the strategy
-      - cumulative_returns (pd.Series): cumulative product of (1 + daily_returns)
-      - win_rate (float)
+    Returns a DataFrame with 'position', 'pnl', 'equity_curve'.
     """
-    # Ensure shapes match
-    n_preds = len(predictions)
-    n_prices = len(close_prices)
-    if n_preds != n_prices:
-        raise ValueError(f"Prediction length ({n_preds}) != close_prices length ({n_prices})")
+    df = signal_data.copy().fillna(method='ffill')  # forward-fill hedge_ratio, etc., if needed
+    
+    df['position'] = 0
+    df['pnl'] = 0.0
+    df['equity_curve'] = 0.0
+    
+    in_position = 0
+    entry_price_btc = 0
+    entry_price_eth = 0
+    entry_spread = 0
+    total_pnl = 0.0
+    
+    prices_btc = df['price_BTC'].values
+    prices_eth = df['price_ETH'].values
+    signals = df['signal'].values
+    zscores = df['zscore'].values
+    hedge_ratios = df['hedge_ratio'].values
+    
+    for i in range(1, len(df)):
+        prev_signal = signals[i-1]
+        current_z = zscores[i]
+        hr = hedge_ratios[i]
+        
+        # Calculate the "current" spread for stop-loss checks
+        current_spread = prices_eth[i] - hr * prices_btc[i]
+        
+        if in_position == 0:
+            # Currently flat, decide to enter on the previous bar's signal
+            if prev_signal == 1:
+                # LONG spread => long ETH, short BTC
+                in_position = 1
+                entry_price_eth = prices_eth[i]
+                entry_price_btc = prices_btc[i]
+                entry_spread = current_spread
+            elif prev_signal == -1:
+                # SHORT spread => short ETH, long BTC
+                in_position = -1
+                entry_price_eth = prices_eth[i]
+                entry_price_btc = prices_btc[i]
+                entry_spread = current_spread
 
-    # We shift close_prices by 1 so that each prediction is used to trade the *next* day
-    # Alternatively, you might do no shift if you’re using “open” next day or intraday data.
-    # Adjust logic depending on how your data is structured.
-    shifted_close = pd.Series(close_prices).shift(-1 * horizon)
-    
-    # Binary trading signal: +1 if > 0.5, -1 otherwise
-    signal = np.where(predictions > 0.5, 1.0, -1.0)
-    
-    # Percentage change for each day (or horizon).
-    # close[t+horizon]/close[t] - 1
-    # We'll do a simple approach: daily return is (close[t+1] - close[t]) / close[t].
-    # For horizon>1, we do close[t+horizon] / close[t] - 1.
-    current_close = pd.Series(close_prices)
-    ret = (shifted_close.values - current_close.values) / current_close.values
-    
-    # Strategy return = signal * market return
-    strat_ret = signal * ret
-    
-    # Subtract transaction cost each time we flip from +1 to -1 or -1 to +1.
-    # For simplicity, assume we open/close a position each day => cost is incurred daily.
-    # If horizon=5, you might adapt the cost logic so cost is only once every 5 days, etc.
-    strat_ret -= cost
+        else:
+            # Already in a position
+            if in_position == 1:
+                # LONG spread => exit if abs(zscore) < exit_z or if stop loss triggers
+                # Stop loss: if the spread moves 'adversely' more than max_adverse_move
+                #   adverse_move = entry_spread - current_spread
+                adverse_move = entry_spread - current_spread
+                if adverse_move > max_adverse_move:
+                    # stop loss triggered
+                    exit_price_eth = prices_eth[i]
+                    exit_price_btc = prices_btc[i]
+                    eth_pnl = exit_price_eth - entry_price_eth
+                    btc_pnl = entry_price_btc - exit_price_btc
+                    trade_pnl = eth_pnl + btc_pnl
+                    trade_pnl_after_fees = trade_pnl - trading_fee_rate * abs(trade_pnl)
+                    total_pnl += trade_pnl_after_fees
+                    in_position = 0
+                else:
+                    if abs(current_z) < exit_z:
+                        # Normal exit
+                        exit_price_eth = prices_eth[i]
+                        exit_price_btc = prices_btc[i]
+                        eth_pnl = exit_price_eth - entry_price_eth
+                        btc_pnl = entry_price_btc - exit_price_btc
+                        trade_pnl = eth_pnl + btc_pnl
+                        trade_pnl_after_fees = trade_pnl - trading_fee_rate * abs(trade_pnl)
+                        total_pnl += trade_pnl_after_fees
+                        in_position = 0
 
-    # Convert to pandas
-    strat_ret = pd.Series(strat_ret, index=current_close.index)
-    
-    # Drop last horizon rows that have NaN because of shifting
-    strat_ret.dropna(inplace=True)
-    
-    # Calculate daily metrics
-    daily_returns = strat_ret
-    cumulative_returns = (1 + daily_returns).cumprod()
-    
-    # Win rate
-    wins = daily_returns[daily_returns > 0].count()
-    total_trades = daily_returns.count()
-    win_rate = wins / total_trades if total_trades > 0 else 0.0
+            else:
+                # SHORT spread => exit if abs(zscore) < exit_z or if stop loss triggers
+                # Stop loss: if the spread moves 'adversely' more than max_adverse_move
+                #   adverse_move = current_spread - entry_spread
+                adverse_move = current_spread - entry_spread
+                if adverse_move > max_adverse_move:
+                    # stop loss triggered
+                    exit_price_eth = prices_eth[i]
+                    exit_price_btc = prices_btc[i]
+                    eth_pnl = entry_price_eth - exit_price_eth  # short ETH => (entry - exit)
+                    btc_pnl = exit_price_btc - entry_price_btc  # long BTC => (exit - entry)
+                    trade_pnl = eth_pnl + btc_pnl
+                    trade_pnl_after_fees = trade_pnl - trading_fee_rate * abs(trade_pnl)
+                    total_pnl += trade_pnl_after_fees
+                    in_position = 0
+                else:
+                    if abs(current_z) < exit_z:
+                        exit_price_eth = prices_eth[i]
+                        exit_price_btc = prices_btc[i]
+                        eth_pnl = entry_price_eth - exit_price_eth
+                        btc_pnl = exit_price_btc - entry_price_btc
+                        trade_pnl = eth_pnl + btc_pnl
+                        trade_pnl_after_fees = trade_pnl - trading_fee_rate * abs(trade_pnl)
+                        total_pnl += trade_pnl_after_fees
+                        in_position = 0
 
-    return daily_returns, cumulative_returns, win_rate
+        df.at[df.index[i], 'position'] = in_position
+        df.at[df.index[i], 'pnl'] = total_pnl
+    
+    df['equity_curve'] = df['pnl'] + initial_capital
+    return df
 
-def annualized_sharpe(daily_returns, trading_days=252):
+
+# Perform the backtest
+backtest_df = backtest_pairs(signal_df,
+                             initial_capital=10000,
+                             trading_fee_rate=0.0004,
+                             exit_z=1.0,
+                             max_adverse_move=50.0)
+
+
+###############################################################################
+# 6. RESULT EVALUATION
+###############################################################################
+def calculate_sharpe(equity_series: pd.Series, freq_hours=1):
     """
-    Annualized Sharpe Ratio = (mean(daily_returns)*trading_days) / (std(daily_returns)*sqrt(trading_days))
+    Calculates a simple Sharpe ratio for the equity curve.
+    :param equity_series: The equity curve series over time
+    :param freq_hours: The frequency of each bar (1 for hourly, 24 for daily, etc.)
+    :return: Sharpe ratio
     """
-    mean_ret = daily_returns.mean()
-    std_ret = daily_returns.std()
+    returns = equity_series.pct_change().dropna()
+    # Convert these hourly returns to an annualized figure:
+    # Approx 24 * 365 = 8760 hours/year, so for hourly data:
+    #   annualized_return = avg_return_per_hour * 8760
+    #   annualized_vol    = std_return_per_hour * sqrt(8760)
+    avg_ret = returns.mean()
+    std_ret = returns.std()
+    
+    annual_factor = 8760 / freq_hours  # approx hours in a year
+    
     if std_ret == 0:
-        return 0.0
-    return (mean_ret * trading_days) / (std_ret * np.sqrt(trading_days))
-
-###############################################################################
-# PART E. EXAMPLE USAGE
-###############################################################################
-
-if __name__ == "__main__":
-    # ---------------------------------------------------------------------
-    # 1) LOAD DATA (replace with your data)
-    # ---------------------------------------------------------------------
-    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    data_file = os.path.join(BASE_DIR, 'data', 'processed', 'BTC-USD_1d_processed.csv')
-    if not os.path.exists(data_file):
-        print(f"File not found: {data_file}. Update data_file path.")
-        exit()
-
-    df = pd.read_csv(data_file, parse_dates=True, index_col=0)
-    df.sort_index(inplace=True)  # ascending date order
-
-    # ---------------------------------------------------------------------
-    # 2) ADD TECHNICAL + FUNDAMENTAL INDICATORS
-    # ---------------------------------------------------------------------
-    df = add_technical_indicators(df)
-    df = add_dummy_fundamental_features(df)
-
-    # ---------------------------------------------------------------------
-    # 3) PREPARE FEN DATA
-    # ---------------------------------------------------------------------
-    # Example: 5-day horizon target => "Will close[t+5] > close[t]?"
-    window_size = 30
-    horizon = 5
-    price_cols = ('open', 'high', 'low', 'close', 'volume')
-    indicator_cols = ['RSI','MACD','MACD_Signal','BB_High','BB_Low','EMA_20','SMA_50']
-    extra_cols = ['PE_Ratio','Sentiment']
-
-    X_price, X_ind, X_seq, X_extra, y, close_prices = prepare_fen_data(
-        df,
-        window_size=window_size,
-        horizon=horizon,
-        price_cols=price_cols,
-        indicator_cols=indicator_cols,
-        extra_cols=extra_cols
-    )
-
-    # ---------------------------------------------------------------------
-    # 4) TRAIN/TEST SPLIT
-    # ---------------------------------------------------------------------
-    split_idx = int(len(X_price) * 0.8)
-    X_price_train, X_price_test = X_price[:split_idx], X_price[split_idx:]
-    X_ind_train, X_ind_test = X_ind[:split_idx], X_ind[split_idx:]
-    X_seq_train, X_seq_test = X_seq[:split_idx], X_seq[split_idx:]
-    X_extra_train, X_extra_test = X_extra[:split_idx], X_extra[split_idx:]
-    y_train, y_test = y[:split_idx], y[split_idx:]
-
-    # For backtest, we also split close prices the same way
-    close_train, close_test = close_prices[:split_idx], close_prices[split_idx:]
+        return 0
     
-    print(f"Train samples: {len(X_price_train)}, Test samples: {len(X_price_test)}")
+    sharpe = (avg_ret * annual_factor) / (std_ret * np.sqrt(annual_factor))
+    return sharpe
 
-    # ---------------------------------------------------------------------
-    # 5) BUILD AND TRAIN MODEL
-    # ---------------------------------------------------------------------
-    model = build_fen_model(
-        input_dim_price=X_price_train.shape[1],
-        input_dim_indicators=X_ind_train.shape[1],
-        input_dim_extra=X_extra_train.shape[1],
-        seq_length=X_seq_train.shape[1],
-        seq_features=X_seq_train.shape[2],
-        task_type='binary',  
-        hidden_units=64,
-        l2_reg=0.001,
-        dropout_rate=0.2
-    )
-    model.summary()
 
-    history = model.fit(
-        [X_price_train, X_ind_train, X_seq_train, X_extra_train],
-        y_train,
-        validation_data=([X_price_test, X_ind_test, X_seq_test, X_extra_test], y_test),
-        epochs=20,
-        batch_size=32,
-        verbose=1
-    )
+# Final performance metrics
+final_equity = backtest_df['equity_curve'].iloc[-1]
+net_profit = final_equity - 10000
+sharpe_ratio = calculate_sharpe(backtest_df['equity_curve'], freq_hours=1)
 
-    # ---------------------------------------------------------------------
-    # 6) EVALUATE CLASSIFICATION ACCURACY
-    # ---------------------------------------------------------------------
-    loss, accuracy = model.evaluate(
-        [X_price_test, X_ind_test, X_seq_test, X_extra_test], 
-        y_test,
-        verbose=0
-    )
-    print(f"\nTest Loss: {loss:.4f}, Test Accuracy: {accuracy:.4f}")
+print("\n[RESULTS]")
+print(f"Final Equity: ${final_equity:.2f}")
+print(f"Net Profit: ${net_profit:.2f}")
+print(f"Estimated Sharpe Ratio: {sharpe_ratio:.2f}")
 
-    # ---------------------------------------------------------------------
-    # 7) BACKTEST: PREDICT, COMPUTE RETURNS, SHARPE, WIN RATE
-    # ---------------------------------------------------------------------
-    preds_test = model.predict([X_price_test, X_ind_test, X_seq_test, X_extra_test]).flatten()
-    
-    # Simple backtest with daily horizon=1 trades
-    # If your label horizon is 5, you might also hold 5 days. 
-    # For illustration, let's do daily trades with cost=0.0005 (0.05%)
-    daily_returns, cumret, win_rate = simple_backtest(
-        predictions=preds_test,
-        close_prices=close_test,
-        horizon=1,       # trade daily (even though label used horizon=5)
-        cost=0.0005
-    )
-    # Compute Sharpe
-    sharpe_val = annualized_sharpe(daily_returns, trading_days=252)
-
-    print(f"Strategy Win Rate: {win_rate*100:.2f}%")
-    print(f"Strategy Annualized Sharpe: {sharpe_val:.2f}")
-
-    # Optionally look at final cumulative return
-    final_cumret = cumret.iloc[-1]
-    print(f"Final Cumulative Return: {final_cumret - 1:.2%}")
-
-    # Inspect sample predictions vs. actual labels
-    print("\nSample predictions:", preds_test[:10])
-    print("Sample test labels:", y_test[:10])
+# Count the number of trades: (0->±1 or ±1->0 transitions)
+trades_mask = (backtest_df['position'].diff() != 0) & (backtest_df['position'] != 0)
+num_trades = trades_mask.sum()
+print(f"Number of trades executed: {num_trades}")
